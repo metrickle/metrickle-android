@@ -1,11 +1,23 @@
 package com.metrickle
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import java.net.URI
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 /*
  * Headless survey engine, a port of `packages/sdk/src/surveys.ts`. It decides *whether and when*
@@ -32,6 +44,28 @@ public interface ActiveSurvey {
     public fun complete()
     /** The user closed it; [atIndex] is the question they were on. */
     public fun dismiss(atIndex: Int)
+
+    /**
+     * The campaign's follow-up: an invite into a study (a booked video call or a self-guided
+     * test), offered after the last answer. Only present while the study is recruiting.
+     */
+    public val followUp: FollowUpConfig? get() = null
+
+    /** Whether this response qualifies for the follow-up (false when there is none). Call after the last answer. */
+    public fun qualifies(): Boolean = false
+
+    /**
+     * Asks for the respondent's personal study link (asked once per response). Returns null when
+     * there's no follow-up, the response doesn't qualify, the study stopped recruiting or is full,
+     * or the request failed: then show the plain thank-you. Open the link in the browser.
+     */
+    public suspend fun invite(): String? = null
+
+    /** Call when the invite is on screen. */
+    public fun followUpOffered() {}
+
+    /** Call when the respondent opens the link. */
+    public fun followUpAccepted() {}
 }
 
 /** Renders a survey. Called on the main thread. */
@@ -69,6 +103,28 @@ internal fun unitHash(s: String): Double {
 internal fun matchPattern(pattern: String, value: String?): Boolean {
     if (value == null) return false
     return if (pattern.endsWith("*")) value.startsWith(pattern.dropLast(1)) else value == pattern
+}
+
+/** What one answer said, for a follow-up's condition. */
+internal data class AnswerFacts(val score: Double?, val values: List<String>?)
+
+/** Port of `followUpMatches` (`packages/schema/src/constants.ts`). No condition: every response qualifies. */
+internal fun followUpMatches(condition: FollowUpWhen?, answers: Map<String, AnswerFacts>): Boolean {
+    if (condition == null) return true
+    val a = answers[condition.questionId] ?: return false
+    val choices = condition.choices
+    if (!choices.isNullOrEmpty()) return a.values?.any { it in choices } == true
+    val score = a.score ?: return false
+    return (condition.min == null || score >= condition.min) && (condition.max == null || score <= condition.max)
+}
+
+/** A personal link is only ever opened if it's https (http only when the host is): never `javascript:` or similar. */
+internal fun safeUrl(url: String?, host: String): String? {
+    if (url == null) return null
+    val u = runCatching { URI(url) }.getOrNull() ?: return null
+    val scheme = u.scheme?.lowercase()
+    if (u.host.isNullOrEmpty()) return null
+    return url.takeIf { scheme == "https" || (scheme == "http" && host.startsWith("http:")) }
 }
 
 internal data class EligibilityContext(
@@ -198,11 +254,24 @@ internal class SurveyEngine(private val client: MetrickleClient) {
     private fun present(c: CampaignConfig) {
         val r = renderer ?: return
         active = c.id
-        val base = props("campaign" to c.id, "version" to c.version, "response" to uuid())
+        val response = uuid()
+        val base = props("campaign" to c.id, "version" to c.version, "response" to response)
         val path = lastPath
         var answered = 0
+        // This response's answers by question, for the follow-up condition. Written on the caller's
+        // thread so qualifies() sees an answer given just before it.
+        val answers = ConcurrentHashMap<String, AnswerFacts>()
+        val fu = c.followUp
+        val inviteLock = Any()
+        var link: Deferred<String?>? = null
+        val offered = AtomicBoolean(false)
+        val accepted = AtomicBoolean(false)
+        fun followUpEvent(yes: Boolean) {
+            client.captureAsync(EventType.TRACK, "\$survey_follow_up", path = path, properties = base + props("study" to fu!!.studyId, "accepted" to yes))
+        }
         val survey = object : ActiveSurvey {
             override val campaign = c
+            override val followUp: FollowUpConfig? = fu
             override fun shown() {
                 client.post {
                     val now = client.clock()
@@ -213,6 +282,7 @@ internal class SurveyEngine(private val client: MetrickleClient) {
             }
 
             override fun answer(question: Question, answer: SurveyAnswer) {
+                answers[question.id] = AnswerFacts(answer.score?.toDouble(), answer.values?.takeIf { it.isNotEmpty() })
                 client.post {
                     answered++
                     val now = client.clock()
@@ -243,6 +313,33 @@ internal class SurveyEngine(private val client: MetrickleClient) {
                     client.capture(EventType.TRACK, "\$survey_dismissed", now, path = path, properties = base + props("at" to atIndex, "answered" to answered))
                 }
             }
+
+            override fun qualifies(): Boolean = fu != null && followUpMatches(fu.condition, answers)
+
+            override suspend fun invite(): String? {
+                if (fu == null || client.isOptedOut || !qualifies()) return null
+                val pending = synchronized(inviteLock) {
+                    link ?: client.scope.async {
+                        val id = client.identity()
+                        requestInvite(client, fu.studyId, c.id, response, id.anonymousId, id.userId)
+                    }.also { link = it }
+                }
+                return try {
+                    pending.await()
+                } catch (e: CancellationException) {
+                    // The caller was cancelled (rethrow); or the client shut down (no link).
+                    currentCoroutineContext().ensureActive()
+                    null
+                }
+            }
+
+            override fun followUpOffered() {
+                if (fu != null && offered.compareAndSet(false, true)) followUpEvent(false)
+            }
+
+            override fun followUpAccepted() {
+                if (fu != null && accepted.compareAndSet(false, true)) followUpEvent(true)
+            }
         }
         client.scope.launch(client.mainDispatcher) {
             try {
@@ -253,6 +350,44 @@ internal class SurveyEngine(private val client: MetrickleClient) {
             }
         }
     }
+}
+
+/** `POST /v1/studies/invite`: the respondent's personal study link, or null for anything but a 201 with a safe link. */
+internal suspend fun requestInvite(
+    client: MetrickleClient,
+    studyId: String,
+    campaignId: String,
+    response: String,
+    anonymousId: String?,
+    userId: String?,
+): String? = try {
+    val body = JsonObject(
+        buildMap {
+            put("writeKey", JsonPrimitive(client.writeKey))
+            put("studyId", JsonPrimitive(studyId))
+            put("campaignId", JsonPrimitive(campaignId))
+            put("response", JsonPrimitive(response))
+            anonymousId?.let { put("anonymousId", JsonPrimitive(it)) }
+            userId?.let { put("userId", JsonPrimitive(it)) }
+        },
+    )
+    val res = client.transport.request(
+        "POST",
+        "${client.host}/v1/studies/invite",
+        mapOf("content-type" to "application/json", "x-metrickle-key" to client.writeKey, "user-agent" to client.userAgent),
+        body.toString(),
+    )
+    if (res.status != 201 || res.body == null) {
+        null
+    } else {
+        val url = MetrickleJson.parseToJsonElement(res.body).jsonObject["url"]?.jsonPrimitive?.contentOrNull
+        safeUrl(url, client.host)
+    }
+} catch (e: CancellationException) {
+    throw e
+} catch (e: Exception) {
+    client.log("study invite failed: $e")
+    null
 }
 
 /** Public survey API: `Metrickle.surveys` / `client.surveys`. */

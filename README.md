@@ -1,6 +1,6 @@
 # Metrickle for Android
 
-Native Android SDK for [Metrickle](https://metrickle.com): accessibility-first UX research and conversion analytics. It implements the shared native contract in [`docs/NATIVE_SDKS.md`](../../docs/NATIVE_SDKS.md), so a funnel, task or survey means the same thing on Android, iOS, Flutter and the web.
+Native Android SDK for [Metrickle](https://metrickle.com): accessibility-first UX research and conversion analytics. It follows the same [event model](https://metrickle.com/developers/events) as the other Metrickle SDKs, so a funnel, task or survey means the same thing on Android, iOS, Flutter and the web.
 
 - `metrickle`: the core SDK. It covers events, sessions, automatic screens, rage taps, form errors, accessibility context, the survey engine (headless) and feedback. It needs Kotlin coroutines, kotlinx.serialization and `androidx.lifecycle:lifecycle-process`. It has no HTTP library (it uses `HttpURLConnection`).
 - `metrickle-compose` adds Jetpack Compose helpers: `TrackScreen`, `Modifier.metrickleTag` and `MetrickleSurveyHost`, a built-in survey sheet that meets WCAG 2.2 AA.
@@ -12,8 +12,8 @@ minSdk 23, compileSdk 36.
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation("com.metrickle:metrickle:0.1.0")
-    implementation("com.metrickle:metrickle-compose:0.1.0") // optional, Compose apps
+    implementation("com.metrickle:metrickle:0.2.0")
+    implementation("com.metrickle:metrickle-compose:0.2.0") // optional, Compose apps
 }
 ```
 
@@ -71,6 +71,17 @@ fun CheckoutScreen() {
 
 `Modifier.metrickleTag(id)` sets `testTag` and gives rage taps a `selector`. Compose has no view ids.
 
+## Revenue from Stripe or RevenueCat
+
+Connect your RevenueCat project (or Stripe account) in the Metrickle dashboard under Integrations → Revenue. Purchases, renewals, refunds and cancels then arrive server-side on the person you identified, so a refund takes back the task they completed. Log in to RevenueCat with the same id:
+
+```kotlin
+Metrickle.identify(user.id)
+Purchases.sharedInstance.logInWith(user.id)
+// Or keep RevenueCat's id and name the Metrickle user:
+// Purchases.sharedInstance.setAttributes(mapOf("metrickle_user_id" to user.id))
+```
+
 ## Options
 
 | Option | Default | |
@@ -113,6 +124,7 @@ The sheet is a Material 3 `ModalBottomSheet`:
 - It follows font scale (it scrolls instead of truncating) and your theme's dark mode.
 - It does not animate when animations are removed.
 - It has a visible Close button, and back or Escape dismisses it. A thank-you message ends the survey.
+- If the campaign has a follow-up and the answers qualify, the Submit button says "One moment…" (focus stays on it) while the sheet asks for the person's study link, for up to 5 seconds. With a link, it shows the invite: focus moves to its heading, and TalkBack reads it. "Choose a time" (a video call) or "Take part" (a self-guided test) opens the link in the browser. "No thanks" goes to the thank-you. Without a link, it shows the thank-you.
 - It uses the brand accent only when the accent reaches 4.5:1 against the sheet. Otherwise it uses your theme's `primary`.
 
 **Headless**: render with your own UI. A custom renderer takes precedence over the host.
@@ -127,6 +139,26 @@ val sub = Metrickle.surveys.onShow { survey ->   // main thread
 }
 Metrickle.surveys.show("cmp_123") // QA: show now, ignoring targeting
 ```
+
+### Follow-ups (study invites)
+
+A campaign can invite people who answered into a study: a booked video call (`moderated`) or a self-guided test on the web (`unmoderated`). `survey.followUp` is set only while the study is recruiting. `when` (the `condition` property) limits the invite to some answers, for example NPS 0–6. The built-in sheet handles all of this. With your own UI, after the last answer:
+
+```kotlin
+survey.complete()
+val fu = survey.followUp
+if (fu != null && survey.qualifies()) {
+    lifecycleScope.launch {
+        // The personal link, asked once per response. Null when the study is full or the request failed.
+        val url = withTimeoutOrNull(5_000) { survey.invite() }
+        if (url == null) return@launch showThankYou()
+        showInvite(fu.prompt, fu.kind, fu.durationMin, fu.incentive) // then call survey.followUpOffered()
+        // When they accept: survey.followUpAccepted(), then open url in the browser (Intent.ACTION_VIEW).
+    }
+}
+```
+
+`invite()` only returns `https` links (or `http` when your `host` is `http`). `followUpOffered()` and `followUpAccepted()` each record `$survey_follow_up` once per response.
 
 ## Feedback
 
@@ -146,7 +178,8 @@ Session, screen, device, app version, locale and accessibility flags are attache
 
 - No Android Advertising ID, device serials or other hardware identifiers. `anonymousId` is a random UUID in app storage, removed when the app is uninstalled.
 - The SDK never captures text field contents, only identifiers you pass (`formError`) and content descriptions.
-- After `optOut()` the SDK makes no network calls at all.
+- After `optOut()` the SDK makes no network calls at all. It clears the queue and removes the anonymous id and session id from the device. It keeps your own user id (from `identify`) and the consent choice. `isOptedOut` changes as soon as `optOut()` or `optIn()` returns.
+- An opted-out device gets no anonymous id, also on later launches and after `reset()`. `optIn()` creates a new one and fetches the config again.
 - `cookieless = true` persists nothing.
 
 ### Google Play Data safety (summary)

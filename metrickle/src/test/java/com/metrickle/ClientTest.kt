@@ -14,6 +14,7 @@ import kotlinx.serialization.json.long
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -301,6 +302,86 @@ class ClientTest {
         c.flushNow()
         assertEquals(listOf("back"), transport.events.map(::name))
         assertNull(storage.data[Keys.OPT_OUT])
+    }
+
+    @Test
+    fun optOutRemovesIdsAndKeepsTheAppsUserId() = runTest {
+        val storage = MemoryStore()
+        val c = client(FakeTransport(), storage)
+        c.identify("u_1")
+        c.consent(true)
+        c.track("x")
+        advanceUntilIdle()
+        assertNotNull(storage.data[Keys.ANON])
+        assertNotNull(storage.data[Keys.SESSION])
+
+        c.optOut()
+        assertTrue(c.isOptedOut) // at once, not after the SDK thread catches up
+        advanceUntilIdle()
+        assertNull(storage.data[Keys.ANON])
+        assertNull(storage.data[Keys.SESSION])
+        assertNull(storage.data[Keys.QUEUE])
+        assertEquals("u_1", storage.data[Keys.USER])
+        assertEquals(ConsentKind.REPLAY, storage.data[Keys.CONSENT])
+        assertNull(c.identity().anonymousId)
+        assertNull(c.identity().sessionId)
+        assertEquals("u_1", c.identity().userId)
+    }
+
+    @Test
+    fun optedOutFirstLaunchCreatesNoId() = runTest {
+        val storage = MemoryStore().apply { set(Keys.OPT_OUT, "1") }
+        val c = client(FakeTransport(), storage)
+        advanceUntilIdle()
+        assertNull(storage.data[Keys.ANON])
+        assertNull(c.identity().anonymousId)
+
+        // An id left behind by an older version is neither used nor kept.
+        storage.set(Keys.ANON, "old")
+        val again = client(FakeTransport(), storage)
+        advanceUntilIdle()
+        assertNull(again.identity().anonymousId)
+        assertNull(storage.data[Keys.ANON])
+    }
+
+    @Test
+    fun resetWhileOptedOutCreatesNoId() = runTest {
+        val storage = MemoryStore()
+        val c = client(FakeTransport(), storage)
+        c.optOut()
+        c.reset()
+        advanceUntilIdle()
+        assertNull(storage.data[Keys.ANON])
+        assertNull(c.identity().anonymousId)
+    }
+
+    @Test
+    fun optInCreatesAnIdAndRefetchesConfig() = runTest {
+        val storage = MemoryStore().apply { set(Keys.OPT_OUT, "1") }
+        val transport = FakeTransport(configBody = """{"v":1,"campaigns":[]}""")
+        val c = client(transport, storage)
+        advanceUntilIdle()
+        assertNull(c.identity().anonymousId)
+
+        c.optIn()
+        assertFalse(c.isOptedOut) // at once
+        advanceUntilIdle()
+        val id = storage.data[Keys.ANON]
+        assertNotNull(id)
+        assertEquals(id, c.identity().anonymousId)
+        assertNull(storage.data[Keys.OPT_OUT])
+        assertEquals(1, transport.requests.count { it.second.contains("/v1/config") })
+        assertNotNull(c.config)
+    }
+
+    @Test
+    fun optOutBeforeRestoreWins() = runTest {
+        val storage = MemoryStore()
+        val c = client(FakeTransport(), storage)
+        c.optOut() // before the stored state is restored
+        advanceUntilIdle()
+        assertTrue(c.isOptedOut)
+        assertNull(storage.data[Keys.ANON])
     }
 
     @Test

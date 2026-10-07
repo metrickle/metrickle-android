@@ -12,6 +12,7 @@ import kotlinx.serialization.json.long
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -188,6 +189,180 @@ class SurveysTest {
         client.screen("/")
         advanceUntilIdle()
         assertEquals(0, shown)
+    }
+
+    // --- Follow-ups ------------------------------------------------------------------------------
+
+    @Test
+    fun followUpMatchingVectors() {
+        val nps = FollowUpWhen(questionId = "nps", min = 0.0, max = 6.0)
+        fun score(n: Int?) = AnswerFacts(n?.toDouble(), null)
+        fun values(vararg v: String) = AnswerFacts(null, v.toList())
+        val cases = listOf(
+            Triple(null, emptyMap(), true),
+            Triple(nps, mapOf("nps" to score(3)), true),
+            Triple(nps, mapOf("nps" to score(0)), true),
+            Triple(nps, mapOf("nps" to score(6)), true),
+            Triple(nps, mapOf("nps" to score(7)), false),
+            Triple(FollowUpWhen(questionId = "nps", min = 9.0), mapOf("nps" to score(10)), true),
+            Triple(nps, emptyMap(), false),
+            Triple(nps, mapOf("nps" to score(null)), false),
+            Triple(FollowUpWhen(questionId = "why", choices = listOf("Price", "Speed")), mapOf("why" to values("Speed", "Other")), true),
+            Triple(FollowUpWhen(questionId = "why", choices = listOf("Price")), mapOf("why" to values("Speed")), false),
+            Triple(FollowUpWhen(questionId = "why", choices = listOf("Price")), mapOf("why" to score(3)), false),
+        )
+        for ((condition, answers, expected) in cases) {
+            assertEquals("$condition $answers", expected, followUpMatches(condition, answers))
+        }
+    }
+
+    @Test
+    fun followUpDecodesAndAMalformedOneKeepsTheCampaign() {
+        fun cfg(followUp: String) = MetrickleJson.decodeFromString(
+            SdkConfig.serializer(),
+            """{"v":1,"campaigns":[{"id":"c","version":1,"questions":[{"id":"nps","type":"nps","prompt":"P"}],
+                "targeting":{"trigger":{"kind":"load"}},"followUp":$followUp}]}""",
+        )
+        val ok = cfg("""{"studyId":"std_1","kind":"moderated","prompt":"Talk to us?","when":{"questionId":"nps","max":6},"incentive":"A gift card","durationMin":30}""")
+        val fu = ok.campaigns.single().followUp!!
+        assertEquals("std_1", fu.studyId)
+        assertEquals(6.0, fu.condition!!.max!!, 0.0)
+        assertEquals(30, fu.durationMin)
+        assertEquals("A gift card", fu.incentive)
+        for (bad in listOf("""{"kind":"moderated","prompt":"x"}""", """{"studyId":"s","kind":"other","prompt":"x"}""", "42", "\"nope\"", "null", """{"studyId":"s","kind":"unmoderated","prompt":"x","when":"bad"}""")) {
+            val c = cfg(bad).campaigns.single()
+            assertEquals("c", c.id)
+            assertNull(bad, c.followUp)
+        }
+    }
+
+    private val moderated = FollowUpConfig(studyId = "std_1", kind = "moderated", prompt = "Talk to us?", condition = FollowUpWhen("nps", max = 6.0), durationMin = 30)
+
+    private suspend fun kotlinx.coroutines.test.TestScope.followUpSurvey(
+        followUp: FollowUpConfig?,
+        transport: FakeTransport = FakeTransport(),
+        options: MetrickleOptions = MetrickleOptions(host = "https://in.example.com/"),
+    ): Pair<MetrickleClient, ActiveSurvey> {
+        val client = client(transport, options = options)
+        var survey: ActiveSurvey? = null
+        client.surveys.onShow { survey = it }
+        client.surveys.engine.setConfigOnClient(client, listOf(campaign().copy(followUp = followUp)))
+        advanceUntilIdle()
+        return client to survey!!
+    }
+
+    private fun invites(t: FakeTransport) = t.requests.filter { it.second.endsWith("/v1/studies/invite") }
+
+    @Test
+    fun qualifyingResponseGetsALinkOnceAndRecordsFollowUpEvents() = runTest {
+        val transport = FakeTransport()
+        val (client, s) = followUpSurvey(moderated, transport)
+        client.identify("u_9")
+        s.shown()
+        s.answer(s.campaign.questions[0], SurveyAnswer(score = 4))
+        s.complete()
+        assertEquals("std_1", s.followUp?.studyId)
+        assertTrue(s.qualifies()) // sees the answer at once, before the SDK thread has run
+        assertEquals("https://app.example.com/s/abc", s.invite())
+        // Asked once per response, however often the renderer calls it.
+        assertEquals("https://app.example.com/s/abc", s.invite())
+        assertEquals(1, invites(transport).size)
+        val i = transport.requests.indexOfFirst { it.second.endsWith("/v1/studies/invite") }
+        assertEquals("POST", transport.requests[i].first)
+        assertEquals("https://in.example.com/v1/studies/invite", transport.requests[i].second)
+        val headers = transport.headers[i]
+        assertEquals("wk_test", headers["x-metrickle-key"])
+        assertEquals("application/json", headers["content-type"])
+        assertTrue(headers["user-agent"]!!.startsWith("metrickle-android/$SDK_VERSION"))
+        val body = Json.parseToJsonElement(transport.requests[i].third!!).jsonObject
+
+        s.followUpOffered()
+        s.followUpOffered()
+        s.followUpAccepted()
+        s.followUpAccepted()
+        advanceUntilIdle()
+        client.flushNow()
+        val response = transport.events.first { it["name"]!!.jsonPrimitive.content == "\$survey_answered" }["properties"]!!.jsonObject["response"]!!
+        assertEquals(
+            mapOf(
+                "writeKey" to JsonPrimitive("wk_test"),
+                "studyId" to JsonPrimitive("std_1"),
+                "campaignId" to JsonPrimitive("cmp_1"),
+                "response" to response,
+                "anonymousId" to JsonPrimitive(client.identity().anonymousId!!),
+                "userId" to JsonPrimitive("u_9"),
+            ),
+            body,
+        )
+        val fu = transport.events.filter { it["name"]!!.jsonPrimitive.content == "\$survey_follow_up" }.map { it["properties"]!!.jsonObject }
+        val expected = listOf(false, true).map {
+            mapOf("campaign" to JsonPrimitive("cmp_1"), "version" to JsonPrimitive(1), "response" to response, "study" to JsonPrimitive("std_1"), "accepted" to JsonPrimitive(it))
+        }
+        assertEquals(expected, fu)
+    }
+
+    @Test
+    fun noInviteForANonMatchingAnswerAFullStudyAnUnsafeLinkOrNoFollowUp() = runTest {
+        // Doesn't qualify: no request at all.
+        val t1 = FakeTransport()
+        val (_, a) = followUpSurvey(moderated, t1)
+        a.answer(a.campaign.questions[0], SurveyAnswer(score = 9))
+        assertFalse(a.qualifies())
+        assertNull(a.invite())
+        assertEquals(0, invites(t1).size)
+
+        // 409 study full, a 200 instead of 201, a network error.
+        for (reply in listOf(HttpResponse(409, "{}"), HttpResponse(200, "{\"url\":\"https://x.example/s\"}"), HttpResponse(0))) {
+            val t = FakeTransport(invite = reply)
+            val (_, b) = followUpSurvey(moderated, t)
+            b.answer(b.campaign.questions[0], SurveyAnswer(score = 2))
+            assertNull(b.invite())
+            assertEquals(1, invites(t).size)
+        }
+
+        // Unsafe links: javascript:, http from an https host, garbage.
+        for (url in listOf("javascript:alert(1)", "http://app.example.com/s/abc", "not a url")) {
+            val t = FakeTransport(invite = HttpResponse(201, "{\"url\":\"$url\"}"))
+            val (_, c) = followUpSurvey(moderated, t)
+            c.answer(c.campaign.questions[0], SurveyAnswer(score = 2))
+            assertNull(url, c.invite())
+        }
+
+        // No follow-up configured: nothing to offer, nothing recorded.
+        val t4 = FakeTransport()
+        val (client4, d) = followUpSurvey(null, t4)
+        assertFalse(d.qualifies())
+        assertNull(d.invite())
+        d.followUpOffered()
+        d.followUpAccepted()
+        advanceUntilIdle()
+        client4.flushNow()
+        assertFalse(t4.events.any { it["name"]!!.jsonPrimitive.content == "\$survey_follow_up" })
+        assertEquals(0, invites(t4).size)
+    }
+
+    @Test
+    fun httpLinksOnlyFromAnHttpHostAndNoInviteWhenOptedOut() = runTest {
+        val t = FakeTransport(invite = HttpResponse(201, "{\"url\":\"http://localhost:8787/s/abc\"}"))
+        val (_, s) = followUpSurvey(moderated.copy(condition = null), t, MetrickleOptions(host = "http://localhost:8787"))
+        assertTrue(s.qualifies()) // no condition: every response qualifies
+        assertEquals("http://localhost:8787/s/abc", s.invite())
+
+        val t2 = FakeTransport()
+        val (client2, s2) = followUpSurvey(moderated.copy(condition = null), t2)
+        client2.optOut()
+        assertNull(s2.invite())
+        assertEquals(0, invites(t2).size)
+    }
+
+    @Test
+    fun safeUrlRules() {
+        assertEquals("https://a.example/s?x=1", safeUrl("https://a.example/s?x=1", "https://in.example.com"))
+        assertNull(safeUrl("http://a.example/s", "https://in.example.com"))
+        assertEquals("http://a.example/s", safeUrl("http://a.example/s", "http://localhost:8787"))
+        assertNull(safeUrl("javascript:alert(1)", "http://localhost:8787"))
+        assertNull(safeUrl("intent://x#Intent;end", "https://in.example.com"))
+        assertNull(safeUrl(null, "https://in.example.com"))
     }
 }
 

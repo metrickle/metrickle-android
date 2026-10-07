@@ -1,5 +1,10 @@
 package com.metrickle.compose
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
+import android.content.Intent
+import android.net.Uri
 import android.provider.Settings
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -62,6 +67,7 @@ import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.disabled
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.paneTitle
@@ -69,6 +75,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.metrickle.ActiveSurvey
+import com.metrickle.FollowUpConfig
 import com.metrickle.Contrast
 import com.metrickle.Metrickle
 import com.metrickle.MetrickleClient
@@ -76,6 +83,7 @@ import com.metrickle.Question
 import com.metrickle.SurveyAnswer
 import com.metrickle.SurveyRenderer
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /** Score range and default end labels per scored question type (same as the web UI). */
 private val SCALES = mapOf(
@@ -84,6 +92,12 @@ private val SCALES = mapOf(
     "ces" to Triple(1..7, "Very difficult", "Very easy"),
     "rating" to Triple(1..5, "Poor", "Excellent"),
 )
+
+/** What the sheet shows after the questions. */
+private enum class Screen { QUESTIONS, INVITE, THANKS }
+
+/** How long to wait for a study link before showing the plain thank-you. */
+private const val INVITE_TIMEOUT_MS = 5_000L
 
 /**
  * Shows active surveys in a Material 3 bottom sheet that meets WCAG 2.2 AA. Place it once at the
@@ -129,14 +143,20 @@ private fun SurveySheet(survey: ActiveSurvey, accentHex: String?, onClosed: () -
     val scope = rememberCoroutineScope()
     val questions = survey.campaign.questions
     var index by remember { mutableIntStateOf(0) }
+    // done: the last answer was given (complete() called), so closing is no longer a dismissal.
     var done by remember { mutableStateOf(false) }
+    var screen by remember { mutableStateOf(Screen.QUESTIONS) }
+    // Waiting for a study link after the last answer: the submit button says "One moment…".
+    var waiting by remember { mutableStateOf(false) }
+    var inviteUrl by remember { mutableStateOf<String?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     val answers = remember { mutableStateMapOf<String, SurveyAnswer>() }
     val heading = remember { FocusRequester() }
 
     LaunchedEffect(survey) { survey.shown() }
     // Focus moves to the heading only when the sheet opens or the user advances.
-    LaunchedEffect(index, done) { runCatching { heading.requestFocus() } }
+    LaunchedEffect(index, screen) { runCatching { heading.requestFocus() } }
+    LaunchedEffect(screen) { if (screen == Screen.INVITE) survey.followUpOffered() }
 
     var closed by remember { mutableStateOf(false) }
     val close: () -> Unit = close@{
@@ -161,6 +181,19 @@ private fun SurveySheet(survey: ActiveSurvey, accentHex: String?, onClosed: () -
         } else {
             done = true
             survey.complete()
+            if (survey.followUp == null || !survey.qualifies()) {
+                screen = Screen.THANKS
+                return
+            }
+            // Ask for the personal link before saying anything: no invite is shown that can't be kept.
+            // Focus stays on the submit button meanwhile.
+            waiting = true
+            scope.launch {
+                val url = withTimeoutOrNull(INVITE_TIMEOUT_MS) { survey.invite() }
+                waiting = false
+                inviteUrl = url
+                screen = if (url != null) Screen.INVITE else Screen.THANKS
+            }
         }
     }
 
@@ -207,13 +240,16 @@ private fun SurveySheet(survey: ActiveSurvey, accentHex: String?, onClosed: () -
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     Text(
-                        if (questions.size > 1 && !done) "Quick survey · ${index + 1} of ${questions.size}" else "Quick survey",
+                        if (questions.size > 1 && screen == Screen.QUESTIONS) "Quick survey · ${index + 1} of ${questions.size}" else "Quick survey",
                         style = MaterialTheme.typography.labelLarge,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Text(
-                        if (done) survey.campaign.thankYou?.takeIf { it.isNotBlank() } ?: "Thanks for your feedback"
-                        else q.prompt + if (q.type == "choice" && q.multiple == true) " (choose all that apply)" else "",
+                        when (screen) {
+                            Screen.THANKS -> survey.campaign.thankYou?.takeIf { it.isNotBlank() } ?: "Thanks for your feedback"
+                            Screen.INVITE -> survey.followUp?.prompt.orEmpty()
+                            Screen.QUESTIONS -> q.prompt + if (q.type == "choice" && q.multiple == true) " (choose all that apply)" else ""
+                        },
                         style = MaterialTheme.typography.titleLarge,
                         color = MaterialTheme.colorScheme.onSurface,
                     )
@@ -222,11 +258,28 @@ private fun SurveySheet(survey: ActiveSurvey, accentHex: String?, onClosed: () -
                     onClick = close,
                     modifier = Modifier
                         .heightIn(min = 48.dp)
-                        .semantics { contentDescription = if (done) "Close" else "Close survey" },
+                        .semantics { contentDescription = if (screen == Screen.QUESTIONS) "Close survey" else "Close" },
                 ) { Text("Close") }
             }
 
-            if (done) {
+            val fu = survey.followUp
+            val url = inviteUrl
+            if (screen == Screen.INVITE && fu != null && url != null) {
+                Invite(
+                    fu,
+                    fill,
+                    onFill,
+                    onDecline = { screen = Screen.THANKS },
+                    onAccept = {
+                        survey.followUpAccepted()
+                        openInBrowser(context, url)
+                        screen = Screen.THANKS
+                    },
+                )
+                return@Column
+            }
+
+            if (screen == Screen.THANKS) {
                 Button(
                     onClick = close,
                     modifier = Modifier.align(Alignment.End).heightIn(min = 48.dp),
@@ -256,10 +309,14 @@ private fun SurveySheet(survey: ActiveSurvey, accentHex: String?, onClosed: () -
 
             Row(Modifier.fillMaxWidth().padding(end = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)) {
                 if (!q.required) {
-                    TextButton(onClick = { advance(null) }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Skip") }
+                    TextButton(
+                        onClick = { if (!waiting) advance(null) },
+                        modifier = Modifier.heightIn(min = 48.dp).semantics { if (waiting) disabled() },
+                    ) { Text("Skip") }
                 }
                 Button(
                     onClick = {
+                        if (waiting) return@Button
                         val a = normalize(answers[q.id])
                         if (a == null && q.required) {
                             error = if (q.type == "text") "Please write an answer, or close the survey." else "Please choose an answer, or close the survey."
@@ -267,12 +324,57 @@ private fun SurveySheet(survey: ActiveSurvey, accentHex: String?, onClosed: () -
                             advance(a)
                         }
                     },
-                    modifier = Modifier.heightIn(min = 48.dp),
+                    // Stays enabled while waiting (disabling it would drop focus); marked disabled for TalkBack.
+                    modifier = Modifier.heightIn(min = 48.dp).semantics { if (waiting) disabled() },
                     colors = ButtonDefaults.buttonColors(containerColor = fill, contentColor = onFill),
-                ) { Text(if (index == questions.size - 1) "Submit" else "Next") }
+                ) { Text(if (waiting) "One moment…" else if (index == questions.size - 1) "Submit" else "Next") }
             }
         }
     }
+}
+
+/** The invite into a study: what it asks for, the thank-you, and the choice. Same copy as the web UI. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun Invite(fu: FollowUpConfig, fill: Color, onFill: Color, onDecline: () -> Unit, onAccept: () -> Unit) {
+    val what = if (fu.kind == "moderated") {
+        "A ${fu.durationMin?.let { "$it-minute " } ?: ""}video call at a time that suits you."
+    } else {
+        // Unmoderated studies run on the web, so this is the web wording on purpose.
+        "A short self-guided test of the site. Takes about 10–15 minutes."
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(what, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
+        fu.incentive?.takeIf { it.isNotBlank() }?.let {
+            Text("As a thank-you: $it", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
+        }
+    }
+    val action = if (fu.kind == "moderated") "Choose a time" else "Take part"
+    FlowRow(
+        Modifier.fillMaxWidth().padding(end = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        TextButton(onClick = onDecline, modifier = Modifier.heightIn(min = 48.dp)) { Text("No thanks") }
+        Button(
+            onClick = onAccept,
+            modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "$action, opens in your browser" },
+            colors = ButtonDefaults.buttonColors(containerColor = fill, contentColor = onFill),
+        ) { Text(action) }
+    }
+}
+
+/** Opens a study link in the system browser. Never throws (no browser installed, for example). */
+private fun openInBrowser(context: Context, url: String) {
+    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE)
+    if (context.findActivity() == null) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    runCatching { context.startActivity(intent) }
+}
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
 }
 
 /** Null when nothing was answered. */

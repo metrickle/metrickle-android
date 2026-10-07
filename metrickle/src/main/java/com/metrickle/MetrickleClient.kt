@@ -89,6 +89,8 @@ public class MetrickleClient internal constructor(private val env: ClientEnv) {
     @Volatile private var userId: String? = null
     @Volatile private var sessionId: String? = null
     @Volatile private var optedOut = false
+    /** The latest optOut()/optIn() call, set at once so restoring stored state never overrides it. */
+    @Volatile private var optChoice: Boolean? = null
     @Volatile private var consents: Set<String> = emptySet()
     @Volatile private var context: EventContext = env.context
 
@@ -193,16 +195,20 @@ public class MetrickleClient internal constructor(private val env: ClientEnv) {
         }
     }
 
-    /** Call on logout: forgets the user and session and starts a new anonymous identity. */
+    /**
+     * Call on logout: forgets the user and session and starts a new anonymous identity. While opted
+     * out, no new anonymous id is created ([optIn] creates one).
+     */
     public fun reset() {
         post {
             userId = null
             session = null
             sessionId = null
-            anonymousId = if (storage != null) uuid() else null
+            anonymousId = if (storage != null && !optedOut) uuid() else null
             storage?.remove(Keys.USER)
             storage?.remove(Keys.SESSION)
-            anonymousId?.let { storage?.set(Keys.ANON, it) }
+            val id = anonymousId
+            if (id != null) storage?.set(Keys.ANON, id) else storage?.remove(Keys.ANON)
         }
     }
 
@@ -212,21 +218,40 @@ public class MetrickleClient internal constructor(private val env: ClientEnv) {
         post { superProps.putAll(props) }
     }
 
-    /** Stops all collection and network calls, clears the queue, and remembers the choice. */
+    /**
+     * Stops all collection and network calls, clears the queue, removes the anonymous and session
+     * ids from the device, and remembers the choice. Your own user id ([identify]) and consent are
+     * kept. Takes effect at once: [isOptedOut] is true when this returns.
+     */
     public fun optOut() {
+        optChoice = true
         optedOut = true
         post {
             optedOut = true
             queue.clear()
+            anonymousId = null
+            session = null
+            sessionId = null
             storage?.set(Keys.OPT_OUT, "1")
             storage?.remove(Keys.QUEUE)
+            storage?.remove(Keys.ANON)
+            storage?.remove(Keys.SESSION)
         }
     }
 
+    /**
+     * Resumes collection after [optOut]: creates a new anonymous id and fetches the config again
+     * (surveys, the feedback switch). Takes effect at once: [isOptedOut] is false when this returns.
+     */
     public fun optIn() {
+        optChoice = false
+        optedOut = false
         post {
             optedOut = false
             storage?.remove(Keys.OPT_OUT)
+            val s = storage
+            if (s != null && anonymousId == null) anonymousId = uuid().also { s.set(Keys.ANON, it) }
+            fetchConfig()
         }
     }
 
@@ -303,18 +328,25 @@ public class MetrickleClient internal constructor(private val env: ClientEnv) {
 
     private fun restore() {
         val s = storage ?: return
-        optedOut = s.get(Keys.OPT_OUT) == "1"
+        // An optOut()/optIn() made before restoring wins over the stored choice (it is applied after this).
+        optedOut = optChoice ?: (s.get(Keys.OPT_OUT) == "1")
         consents = s.get(Keys.CONSENT)?.split(",")?.filter { it == ConsentKind.REPLAY }?.toSet().orEmpty()
-        anonymousId = s.get(Keys.ANON) ?: uuid().also { s.set(Keys.ANON, it) }
         userId = s.get(Keys.USER)
-        session = s.get(Keys.SESSION)?.let { runCatching { MetrickleJson.decodeFromString(SessionState.serializer(), it) }.getOrNull() }
-        sessionId = session?.id
+        // An opted-out device gets no anonymous id and no session; optIn() creates a new id.
         if (!optedOut) {
+            anonymousId = s.get(Keys.ANON) ?: uuid().also { s.set(Keys.ANON, it) }
+            session = s.get(Keys.SESSION)?.let { runCatching { MetrickleJson.decodeFromString(SessionState.serializer(), it) }.getOrNull() }
+            sessionId = session?.id
             val saved = s.get(Keys.QUEUE)?.let {
                 runCatching { MetrickleJson.decodeFromString(ListSerializer(IngestEvent.serializer()), it) }.getOrNull()
             }.orEmpty()
             val cutoff = env.clock() - MAX_EVENT_AGE_MS
             queue.addAll(saved.filter { it.ts >= cutoff }.takeLast(MAX_QUEUE))
+        } else {
+            // Ids left by an SDK version that kept them after opting out.
+            s.remove(Keys.ANON)
+            s.remove(Keys.SESSION)
+            s.remove(Keys.QUEUE)
         }
     }
 

@@ -97,7 +97,7 @@ public object Metrickle {
     /** Feedback of the shared client. @throws IllegalStateException before [init]. */
     @JvmStatic public val feedback: Feedback get() = shared().feedback
 
-    /** `metrickle-android/0.1.0 (Android 14; Pixel 8)`. Must not look like a bot to the server's filter. */
+    /** `metrickle-android/0.2.0 (Android 14; Pixel 8)`. Must not look like a bot to the server's filter. */
     internal fun userAgent(): String =
         "metrickle-android/$SDK_VERSION (Android ${Build.VERSION.RELEASE}; ${Build.MODEL})".filter { it.code in 0x20..0x7e }
 

@@ -8,7 +8,12 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 
 /** Records requests and answers with scripted statuses (default 200). */
-class FakeTransport(var status: (String) -> Int = { 200 }, var configBody: String? = null) : Transport {
+class FakeTransport(
+    var status: (String) -> Int = { 200 },
+    var configBody: String? = null,
+    /** Answer to `POST /v1/studies/invite`. */
+    var invite: HttpResponse = HttpResponse(201, "{\"url\":\"https://app.example.com/s/abc\"}"),
+) : Transport {
     val requests = mutableListOf<Triple<String, String, String?>>()
     val headers = mutableListOf<Map<String, String>>()
     /** Batches answered with a 2xx. */
@@ -18,6 +23,7 @@ class FakeTransport(var status: (String) -> Int = { 200 }, var configBody: Strin
         requests += Triple(method, url, body)
         this.headers += headers
         if (url.contains("/v1/config")) return if (configBody != null) HttpResponse(200, configBody) else HttpResponse(404)
+        if (url.endsWith("/v1/studies/invite")) return invite
         val code = status(url)
         if (code in 200..299 && url.endsWith("/v1/batch")) delivered += Json.parseToJsonElement(body!!).jsonObject
         return HttpResponse(code, "{\"id\":\"fb_1\"}")

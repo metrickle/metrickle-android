@@ -1,8 +1,14 @@
 package com.metrickle
 
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.builtins.nullable
+import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.JsonObject
 
 /*
@@ -134,7 +140,58 @@ public data class CampaignConfig(
     val targeting: Targeting,
     val thankYou: String? = null,
     val version: Int,
+    /**
+     * An invite into a study (a booked video call or a self-guided test), offered after the last
+     * answer. Only present while the study is recruiting. A malformed one is dropped, not the campaign.
+     */
+    @Serializable(with = LossyFollowUpSerializer::class)
+    val followUp: FollowUpConfig? = null,
 )
+
+/** Which answers qualify for a follow-up. */
+@Serializable
+public data class FollowUpWhen(
+    val questionId: String,
+    /** Scores: an inclusive band, e.g. NPS detractors are 0–6. */
+    val min: Double? = null,
+    val max: Double? = null,
+    /** Choice questions: any of these answers. */
+    val choices: List<String>? = null,
+)
+
+/** A campaign's follow-up into a study. */
+@Serializable
+public data class FollowUpConfig(
+    val studyId: String,
+    /** `moderated` (a booked video call) or `unmoderated` (a self-guided test on the web). */
+    val kind: String,
+    val prompt: String,
+    /** Which answers qualify; null means every completed response does. JSON field `when`. */
+    @SerialName("when") val condition: FollowUpWhen? = null,
+    /** What respondents get as a thank-you, e.g. "a £20 gift card". */
+    val incentive: String? = null,
+    /** Moderated: the session length in minutes. */
+    val durationMin: Int? = null,
+)
+
+/** Decodes `followUp`, or null when it is missing or malformed, so the campaign itself survives. */
+internal object LossyFollowUpSerializer : KSerializer<FollowUpConfig?> {
+    private val inner = FollowUpConfig.serializer()
+    override val descriptor: SerialDescriptor = inner.nullable.descriptor
+
+    override fun deserialize(decoder: Decoder): FollowUpConfig? {
+        val json = decoder as? JsonDecoder ?: return runCatching { decoder.decodeSerializableValue(inner) }.getOrNull()
+        val element = json.decodeJsonElement()
+        val fu = runCatching { json.json.decodeFromJsonElement(inner, element) }.getOrNull() ?: return null
+        return fu.takeIf { it.studyId.isNotEmpty() && it.prompt.isNotBlank() && it.kind in FOLLOW_UP_KINDS }
+    }
+
+    override fun serialize(encoder: Encoder, value: FollowUpConfig?) {
+        encoder.encodeSerializableValue(inner.nullable, value)
+    }
+}
+
+internal val FOLLOW_UP_KINDS = setOf("moderated", "unmoderated")
 
 @Serializable
 public data class Branding(val poweredBy: Boolean = true, val accent: String? = null)
